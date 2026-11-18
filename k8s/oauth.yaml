@@ -1,0 +1,121 @@
+# Apply:   kubectl apply -f k8s/oauth.yaml
+# Test:    kubectl -n oauth-demo port-forward svc/oauth-server 3000:3000 &
+#          kubectl -n oauth-demo port-forward svc/oauth-test-client 4000:4000 &
+#          open http://localhost:4000
+# The URLs below assume port-forwarding; change ISSUER / BASE_URL / redirect URIs if you put these behind an Ingress.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: oauth-demo
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: oauth-demo
+  namespace: oauth-demo
+type: Opaque
+stringData:
+  client-id: demo-client
+  client-secret: demo-secret # change me
+  # Optional: enable "Log in with Google" in the test client.
+  # google-client-id: 1234-abc.apps.googleusercontent.com
+  # google-client-secret: GOCSPX-...
+  # Optional: a stable signing key (PKCS#8 PEM) so tokens survive restarts.
+  # Generate with: openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048
+  # signing-key.pem: |
+  #   -----BEGIN PRIVATE KEY-----
+  #   ...
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth-server
+  namespace: oauth-demo
+  labels: { app: oauth-server }
+spec:
+  replicas: 1 # state is in-memory; do not scale out without an external store
+  selector:
+    matchLabels: { app: oauth-server }
+  template:
+    metadata:
+      labels: { app: oauth-server }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000 }
+      containers:
+        - name: server
+          image: oauth2-demo:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 3000 }]
+          env:
+            - { name: ISSUER, value: "http://localhost:3000" }
+            - { name: DEMO_CLIENT_REDIRECT_URIS, value: "http://localhost:4000/callback" }
+            - name: DEMO_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: oauth-demo, key: client-id } }
+            - name: DEMO_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: oauth-demo, key: client-secret } }
+            - name: SIGNING_KEY_PEM
+              valueFrom: { secretKeyRef: { name: oauth-demo, key: signing-key.pem, optional: true } }
+          readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 15 }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth-server
+  namespace: oauth-demo
+spec:
+  selector: { app: oauth-server }
+  ports: [{ name: http, port: 3000, targetPort: http }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth-test-client
+  namespace: oauth-demo
+  labels: { app: oauth-test-client }
+spec:
+  replicas: 1 # sessions are in-memory
+  selector:
+    matchLabels: { app: oauth-test-client }
+  template:
+    metadata:
+      labels: { app: oauth-test-client }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000 }
+      containers:
+        - name: client
+          image: oauth2-demo:latest
+          imagePullPolicy: IfNotPresent
+          command: ["node", "dist/client/index.js"]
+          ports: [{ name: http, containerPort: 4000 }]
+          env:
+            - { name: BASE_URL, value: "http://localhost:4000" }
+            - { name: AUTH_SERVER_PUBLIC_URL, value: "http://localhost:3000" }
+            - { name: AUTH_SERVER_INTERNAL_URL, value: "http://oauth-server.oauth-demo.svc.cluster.local:3000" }
+            - name: LOCAL_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: oauth-demo, key: client-id } }
+            - name: LOCAL_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: oauth-demo, key: client-secret } }
+            - name: GOOGLE_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: oauth-demo, key: google-client-id, optional: true } }
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: oauth-demo, key: google-client-secret, optional: true } }
+          readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 15 }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth-test-client
+  namespace: oauth-demo
+spec:
+  selector: { app: oauth-test-client }
+  ports: [{ name: http, port: 4000, targetPort: http }]

@@ -1,0 +1,22 @@
+# Local end-to-end test: open http://localhost:4000 and log in as alice / password.
+services:
+  oauth-server:
+    build: .
+    image: oauth2-demo:latest
+    ports: ["3000:3000"]
+    environment:
+      ISSUER: http://localhost:3000
+      DEMO_CLIENT_REDIRECT_URIS: http://localhost:4000/callback
+
+  test-client:
+    image: oauth2-demo:latest
+    command: ["node", "dist/client/index.js"]
+    ports: ["4000:4000"]
+    depends_on: [oauth-server]
+    environment:
+      BASE_URL: http://localhost:4000
+      AUTH_SERVER_PUBLIC_URL: http://localhost:3000     # what the browser is redirected to
+      AUTH_SERVER_INTERNAL_URL: http://oauth-server:3000 # container-to-container calls
+      # Optional: enable "Log in with Google" (export these in your shell or put them in .env)
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
