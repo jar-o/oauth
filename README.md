@@ -1,5 +1,7 @@
 # OAuth2 demo server + test client (TypeScript)
 
+![Screenshot](screen.png)
+
 Two small Express apps in one package:
 
 | App | Path | Port | What it is |
