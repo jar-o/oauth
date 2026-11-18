@@ -24,7 +24,9 @@ export const config = {
   accessTokenTtlSec: Number(env("ACCESS_TOKEN_TTL", "900")),
   refreshTokenTtlSec: Number(env("REFRESH_TOKEN_TTL", "86400")),
   authCodeTtlSec: 60,
-  /** Optional PEM-encoded PKCS#8 RSA private key. If unset, one is generated at boot. */
+  /** Directory for the RocksDB datastore. Must be writable and used by one process only. */
+  dataDir: env("DATA_DIR", "./data"),
+  /** Optional PEM-encoded PKCS#8 RSA private key. If unset, one is generated once and stored in the DB. */
   signingKeyPem: process.env.SIGNING_KEY_PEM,
   supportedScopes: ["openid", "profile", "email", "read", "write", "offline_access"],
 

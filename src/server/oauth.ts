@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import { config, type ClientConfig } from "./config.js";
-import { authCodes, consumeAuthCode, randomToken, refreshTokens, revokedJtis } from "./store.js";
+import { authCodes, consumeAuthCode, getRefreshToken, randomToken, refreshTokens, revokedJtis } from "./store.js";
 import { getJwks, signAccessToken, signIdToken, userClaims, verifyAccessToken } from "./tokens.js";
 import { escapeHtml, page } from "./html.js";
 
@@ -161,7 +161,7 @@ oauthRouter.post("/authorize", (req, res) => {
   }
 
   const code = randomToken();
-  authCodes.set(code, {
+  authCodes.put(code, {
     clientId: p.client.clientId,
     userId: user.id,
     redirectUri: p.redirectUri,
@@ -188,7 +188,7 @@ async function issueTokens(res: Response, userId: string, client: ClientConfig, 
   // Always issue a refresh token to confidential clients; public clients must ask for offline_access.
   if (client.clientSecret !== undefined || scope.includes("offline_access")) {
     const rt = randomToken();
-    refreshTokens.set(rt, { clientId: client.clientId, userId, scope, expiresAt: Date.now() + config.refreshTokenTtlSec * 1000 });
+    refreshTokens.put(rt, { clientId: client.clientId, userId, scope, expiresAt: Date.now() + config.refreshTokenTtlSec * 1000 });
     body.refresh_token = rt;
   }
   res.set("Cache-Control", "no-store").json(body);
@@ -210,8 +210,9 @@ oauthRouter.post("/token", async (req, res) => {
     }
 
     case "refresh_token": {
-      const entry = b.refresh_token ? refreshTokens.get(b.refresh_token) : undefined;
-      if (!entry || entry.clientId !== client.clientId || entry.expiresAt < Date.now())
+      // get → validate → delete runs synchronously, so two concurrent requests can't both rotate it.
+      const entry = b.refresh_token ? getRefreshToken(b.refresh_token) : undefined;
+      if (!entry || entry.clientId !== client.clientId)
         return oauthError(res, 400, "invalid_grant", "Invalid or expired refresh token");
       refreshTokens.delete(b.refresh_token!); // rotate
       let scope = entry.scope;
@@ -260,8 +261,8 @@ oauthRouter.post("/introspect", async (req, res) => {
   const token = req.body?.token as string | undefined;
   if (!token) return res.json({ active: false });
 
-  const rt = refreshTokens.get(token);
-  if (rt && rt.expiresAt > Date.now()) {
+  const rt = getRefreshToken(token);
+  if (rt) {
     return res.json({ active: true, token_type: "refresh_token", client_id: rt.clientId, sub: rt.userId, scope: rt.scope.join(" "), exp: Math.floor(rt.expiresAt / 1000) });
   }
   const claims = await verifyAccessToken(token);
@@ -279,7 +280,7 @@ oauthRouter.post("/revoke", async (req, res) => {
     const rt = refreshTokens.get(token);
     if (rt?.clientId === client.clientId) refreshTokens.delete(token);
     const claims = await verifyAccessToken(token);
-    if (claims?.client_id === client.clientId && claims.exp) revokedJtis.set(claims.jti, claims.exp * 1000);
+    if (claims?.client_id === client.clientId && claims.exp) revokedJtis.put(claims.jti, { expiresAt: claims.exp * 1000 });
   }
   res.status(200).end(); // always 200 per spec, even for unknown tokens
 });

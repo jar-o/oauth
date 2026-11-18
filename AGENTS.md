@@ -29,10 +29,10 @@ There is no automated test suite. Verify changes by running both apps and drivin
 ## Conventions
 
 - ESM (`"type": "module"`, `NodeNext`): relative imports **must** use the `.js` extension (`import { config } from "./config.js"`).
-- Runtime deps are only `express` and `jose`. Prefer `node:crypto` and `fetch` over adding packages.
+- Server runtime deps are `express`, `jose`, and `@harperfast/rocksdb-js` (prebuilt native binaries, no compiler needed). Prefer `node:crypto` and `fetch` over adding packages.
 - All configuration comes from env vars, read once at startup. There's no config file.
 - HTML is rendered from template strings. **Always** pass interpolated values through `escapeHtml` (server) / `esc` (client).
-- All state lives in in-memory `Map`s. Both apps assume a single replica (the k8s manifest pins `replicas: 1`).
+- **Server** state is persisted in an embedded RocksDB directory (`DATA_DIR`, default `./data`, git-ignored). **Client** sessions are still in-memory `Map`s. RocksDB allows one process per data directory, so the server is single-replica by design (k8s: `replicas: 1` + `Recreate`).
 
 ---
 
@@ -42,17 +42,27 @@ There is no automated test suite. Verify changes by running both apps and drivin
 
 | File | Responsibility |
 |---|---|
-| `index.ts` | Boot: `await initKeys()`, body parsers, mounts `oauthRouter` at `/` and `apiRouter` at `/api`, `/healthz`, 60s `sweepExpired` timer, graceful shutdown |
+| `index.ts` | Boot: `openDb()`, `await initKeys()`, body parsers, mounts `oauthRouter` at `/` and `apiRouter` at `/api`, `/healthz`, 60s `sweepExpired` timer, graceful shutdown (closes the HTTP server, then the DB) |
 | `config.ts` | Env parsing. Clients and users default to a demo client and alice/bob; `CLIENTS_JSON` / `USERS_JSON` replace them wholesale |
-| `store.ts` | In-memory stores: `authCodes`, `refreshTokens`, `revokedJtis`. `randomToken()`, `consumeAuthCode()`, `sweepExpired()` |
+| `db.ts` | Opens/closes RocksDB and defines `Collection<T>`: a typed wrapper around one column family (`get`/`has`/`put`/`delete`/`take`/`entries`/`deleteWhere`). All calls are **synchronous** |
+| `store.ts` | The collections (`auth_codes`, `refresh_tokens`, `revoked_jtis`, `notes`, `meta`) and the domain helpers: `consumeAuthCode()`, `getRefreshToken()`, `isJtiRevoked()`, `addNote()`/`listNotes()`, `sweepExpired()`, `randomToken()` |
 | `tokens.ts` | RSA key management, JWT signing/verification, JWKS, OIDC user claims |
 | `oauth.ts` | All protocol endpoints (discovery, `/authorize`, `/token`, `/userinfo`, `/introspect`, `/revoke`) |
 | `api.ts` | `requireAuth(...scopes)` bearer middleware + example resource endpoints |
 | `html.ts` | `escapeHtml` and the `page()` layout for the login screen |
 
-### Keys and tokens (`tokens.ts`)
+### Datastore (`db.ts`, `store.ts`)
 
-- `initKeys()` imports `SIGNING_KEY_PEM` (PKCS#8 RSA), or generates an ephemeral 2048-bit key. It derives the public key and a `kid` (truncated SHA-256 of the JWK's `e`/`kty`/`n`). Ephemeral keys mean every restart invalidates all issued tokens.
+- One RocksDB database at `DATA_DIR` (created with mode `0700`, because it holds refresh tokens and possibly the signing key). Each collection is a column family, opened lazily by `db.use(name)`. Values are plain objects, serialized by the library with msgpack.
+- **Everything is sync on purpose.** Node runs each sync call to completion, so read-validate-delete sequences (`take()` for codes, get → check → delete for refresh rotation in `/token`) can't interleave between requests. Don't put an `await` between reading a single-use record and deleting it.
+- Expiry: every record has an absolute `expiresAt` (ms). Reads ignore expired records (`live()`), and `sweepExpired()` deletes them every 60s with a full scan, which is fine at this scale.
+- Note keys are a zero-padded timestamp plus a random suffix, so `entries()` (a key-ordered range scan) returns them in creation order. Use the same trick for any other ordered collection.
+- To add a collection: `export const things = new Collection<Thing>("things")` in `store.ts`. If the records expire, add it to `sweepExpired()`.
+- Only one process can open `DATA_DIR`. A second one fails at startup with `ERR_DATABASE_LOCKED`. When testing, give your copy its own `DATA_DIR`.
+
+### Keys and tokens
+
+- `initKeys()` picks the signing key in this order: `SIGNING_KEY_PEM` env → the key stored in the `meta` collection → generate a 2048-bit RSA key and store it in `meta`. So by default the key (and every token signed with it) survives restarts, as long as `DATA_DIR` does. It derives the public key and a `kid` (truncated SHA-256 of the JWK's `e`/`kty`/`n`).
 - **Access tokens** are RS256 JWTs with header `typ: at+jwt`. Claims: `iss` = `aud` = `config.issuer` (the server is its own resource server), `sub` (user id, or client id for `client_credentials`), `client_id`, space-delimited `scope`, random `jti`, and `exp` = `ACCESS_TOKEN_TTL`.
 - **ID tokens** are RS256 JWTs with `typ: JWT`, `aud` = client id, an optional `nonce`, and profile/email claims gated by scope via `userClaims()`.
 - **Refresh tokens** are *opaque* random strings stored in `refreshTokens`, not JWTs.
@@ -161,9 +171,9 @@ The SDK does not verify ID token signatures (it would need `jose`). The test cli
 
 ## Deployment files
 
-- `Dockerfile`: multi-stage, one image. The default `CMD` runs the server; override it with `node dist/client/index.js` for the client. It runs as `node` (uid 1000).
-- `docker-compose.yml`: the client reaches the server at `http://oauth-server:3000` internally, and at `localhost:3000` from the browser. Google credentials are passed in from the host env or `.env`.
-- `k8s/oauth.yaml`: a namespace, Secret, and Deployment + Service for each app. The URLs assume `kubectl port-forward`. Optional Secret keys: `signing-key.pem`, `google-client-id`, and `google-client-secret`.
+- `Dockerfile`: multi-stage, one image. The default `CMD` runs the server; override it with `node dist/client/index.js` for the client. It runs as `node` (uid 1000). `DATA_DIR=/data` is declared as a `VOLUME`.
+- `docker-compose.yml`: the client reaches the server at `http://oauth-server:3000` internally, and at `localhost:3000` from the browser. The server's RocksDB lives in the named volume `oauth-data`. Google credentials are passed in from the host env or `.env`.
+- `k8s/oauth.yaml`: a namespace, Secret, and Deployment + Service for each app, plus a 1Gi PVC mounted at `/data` for the server. The server Deployment uses `strategy: Recreate`, because a rolling update would start the new pod while the old one still holds the RocksDB lock. The URLs assume `kubectl port-forward`. Optional Secret keys: `signing-key.pem`, `google-client-id`, and `google-client-secret`.
 
 If you change an env var name, update `config.ts` or the client, plus `docker-compose.yml`, `k8s/oauth.yaml`, `.env.example`, and the README.
 
@@ -172,14 +182,15 @@ If you change an env var name, update `config.ts` or the client, plus `docker-co
 - **Redirect URIs are exact-match.** The client always sends `$BASE_URL/callback`. The local server's `DEMO_CLIENT_REDIRECT_URIS` and Google's "Authorized redirect URIs" must contain that exact string. Google's `redirect_uri_mismatch` almost always means a console misconfiguration, such as the URI being entered under *JavaScript origins*.
 - **`ISSUER` must equal the client's `AUTH_SERVER_PUBLIC_URL`**, or ID token and `iss` checks fail.
 - `tsx watch` doesn't reload `.env`, so restart the client after editing it.
-- In-memory state is lost on restart. Users must log in again, and with an ephemeral key, all outstanding tokens become invalid.
+- Server state persists in `DATA_DIR` (delete the directory to reset everything). Client sessions are in memory, so restarting the client logs users out of the test app, but their server-side tokens stay valid.
+- `ERR_DATABASE_LOCKED` at startup means another server process (often the user's own `npm run dev:server`) already has that `DATA_DIR` open.
 - Ports 3000 and 4000 may already be taken by the user's own dev processes. When testing, run your copies on other ports (see below) rather than killing theirs.
 
 ## Verifying changes
 
 ```sh
 npm run build
-PORT=3100 ISSUER=http://localhost:3100 DEMO_CLIENT_REDIRECT_URIS=http://localhost:4100/callback node dist/server/index.js &
+DATA_DIR=$(mktemp -d) PORT=3100 ISSUER=http://localhost:3100 DEMO_CLIENT_REDIRECT_URIS=http://localhost:4100/callback node dist/server/index.js &
 PORT=4100 BASE_URL=http://localhost:4100 AUTH_SERVER_PUBLIC_URL=http://localhost:3100 node dist/client/index.js &
 ```
 

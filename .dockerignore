@@ -6,3 +6,4 @@ k8s
 *.md
 .env
 sdk
+data

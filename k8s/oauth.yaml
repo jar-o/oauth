@@ -20,11 +20,22 @@ stringData:
   # Optional: enable "Log in with Google" in the test client.
   # google-client-id: 1234-abc.apps.googleusercontent.com
   # google-client-secret: GOCSPX-...
-  # Optional: a stable signing key (PKCS#8 PEM) so tokens survive restarts.
+  # Optional: a fixed signing key (PKCS#8 PEM). If unset, the server generates one and stores it in its RocksDB volume.
   # Generate with: openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048
   # signing-key.pem: |
   #   -----BEGIN PRIVATE KEY-----
   #   ...
+---
+# RocksDB datastore for the auth server (codes, refresh tokens, revocations, notes, generated signing key).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oauth-server-data
+  namespace: oauth-demo
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 1Gi }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -33,20 +44,28 @@ metadata:
   namespace: oauth-demo
   labels: { app: oauth-server }
 spec:
-  replicas: 1 # state is in-memory; do not scale out without an external store
+  # RocksDB allows one process per data directory: exactly 1 replica, and Recreate so the
+  # old pod releases the DB lock before the new one starts (RollingUpdate would deadlock).
+  replicas: 1
+  strategy: { type: Recreate }
   selector:
     matchLabels: { app: oauth-server }
   template:
     metadata:
       labels: { app: oauth-server }
     spec:
-      securityContext: { runAsNonRoot: true, runAsUser: 1000 }
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, fsGroup: 1000 }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: oauth-server-data }
       containers:
         - name: server
           image: oauth2-demo:latest
           imagePullPolicy: IfNotPresent
           ports: [{ name: http, containerPort: 3000 }]
+          volumeMounts: [{ name: data, mountPath: /data }]
           env:
+            - { name: DATA_DIR, value: /data }
             - { name: ISSUER, value: "http://localhost:3000" }
             - { name: DEMO_CLIENT_REDIRECT_URIS, value: "http://localhost:4000/callback" }
             - name: DEMO_CLIENT_ID
@@ -58,8 +77,8 @@ spec:
           readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 5 }
           livenessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 15 }
           resources:
-            requests: { cpu: 50m, memory: 64Mi }
-            limits: { memory: 256Mi }
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 384Mi } # headroom for RocksDB memtables + block cache
           securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
 ---
 apiVersion: v1

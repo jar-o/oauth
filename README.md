@@ -25,6 +25,8 @@ Or with Docker: `docker compose up --build`, then open http://localhost:4000.
 
 Supports the authorization code flow with PKCE (S256 is required), refresh tokens (rotated on every use), and client credentials. Access tokens are RS256 JWTs (`typ: at+jwt`).
 
+State is stored in an embedded [RocksDB](https://rocksdb.org) datastore under `DATA_DIR` (default `./data`): authorization codes, refresh tokens, revoked access tokens, API notes, and the generated signing key. It's a plain directory with no database server to run. Restarting the server keeps everyone's tokens valid; delete the directory to reset.
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /.well-known/openid-configuration` | Discovery metadata (also at `/.well-known/oauth-authorization-server`) |
@@ -53,7 +55,8 @@ curl -H "Authorization: Bearer $TOKEN" localhost:3000/api/data
 |---|---|---|
 | `PORT` | `3000` | |
 | `ISSUER` | `http://localhost:3000` | Public URL. Used as `iss`/`aud` and in discovery |
-| `SIGNING_KEY_PEM` | *(generated)* | PKCS#8 RSA key. Without it, tokens are invalidated on every restart |
+| `DATA_DIR` | `./data` | RocksDB datastore directory (one server process at a time) |
+| `SIGNING_KEY_PEM` | *(generated)* | PKCS#8 RSA key. If unset, a key is generated on first start and stored in the datastore |
 | `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL` | `900` / `86400` | Seconds |
 | `DEMO_CLIENT_ID` / `DEMO_CLIENT_SECRET` | `demo-client` / `demo-secret` | |
 | `DEMO_CLIENT_REDIRECT_URIS` | `http://localhost:4000/callback` | Comma-separated, matched exactly |
@@ -107,6 +110,6 @@ The manifest sets `ISSUER`/`BASE_URL` to the port-forwarded localhost URLs. If y
 
 ## Limitations (it's a demo)
 
-- All state (codes, refresh tokens, revocations, sessions) is **in memory**, so run 1 replica of each app. Use Redis or a database before scaling out.
+- The server persists its state (authorization codes, refresh tokens, revocations, notes, generated signing key) in an embedded **RocksDB** directory (`DATA_DIR`). That makes it single-process: RocksDB locks the directory, so run **one** server replica (k8s uses `Recreate` + a PVC). The test client's sessions are still in memory.
 - Users and clients come from env vars, and passwords are plaintext. Use a real user store with password hashing (argon2/bcrypt) before relying on this.
 - No rate limiting on `/authorize` or `/token`. Deploy with HTTPS (also set `BASE_URL` to `https://…` so the client marks cookies `Secure`).

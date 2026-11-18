@@ -4,6 +4,7 @@ services:
     build: .
     image: oauth2-demo:latest
     ports: ["3000:3000"]
+    volumes: ["oauth-data:/data"] # RocksDB datastore; `docker compose down -v` wipes it
     environment:
       ISSUER: http://localhost:3000
       DEMO_CLIENT_REDIRECT_URIS: http://localhost:4000/callback
@@ -20,3 +21,6 @@ services:
       # Optional: enable "Log in with Google" (export these in your shell or put them in .env)
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+
+volumes:
+  oauth-data:

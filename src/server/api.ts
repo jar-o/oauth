@@ -1,5 +1,6 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { verifyAccessToken, type AccessTokenClaims } from "./tokens.js";
+import { addNote, listNotes } from "./store.js";
 
 declare module "express-serve-static-core" {
   interface Request {
@@ -47,12 +48,9 @@ apiRouter.get("/data", requireAuth("read"), (req, res) => {
   });
 });
 
-const notes: { by: string; text: string; at: string }[] = [];
 apiRouter.post("/notes", requireAuth("write"), (req, res) => {
   const text = String(req.body?.text ?? "").slice(0, 500);
   if (!text) return void res.status(400).json({ error: "text is required" });
-  const note = { by: req.auth!.sub, text, at: new Date().toISOString() };
-  notes.push(note);
-  res.status(201).json(note);
+  res.status(201).json(addNote({ by: req.auth!.sub, text, at: new Date().toISOString() }));
 });
-apiRouter.get("/notes", requireAuth("read"), (_req, res) => res.json(notes));
+apiRouter.get("/notes", requireAuth("read"), (_req, res) => res.json(listNotes()));

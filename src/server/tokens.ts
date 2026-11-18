@@ -1,7 +1,7 @@
 import { createPublicKey, generateKeyPairSync, createHash } from "node:crypto";
 import { SignJWT, jwtVerify, exportJWK, importPKCS8, importSPKI, type JWK, type JWTPayload, type CryptoKey } from "jose";
 import { config, type UserConfig } from "./config.js";
-import { randomToken, revokedJtis } from "./store.js";
+import { isJtiRevoked, meta, randomToken } from "./store.js";
 
 const ALG = "RS256";
 
@@ -11,9 +11,15 @@ let publicJwk: JWK;
 
 export async function initKeys() {
   let pem = config.signingKeyPem;
-  if (!pem) {
-    console.warn("[keys] SIGNING_KEY_PEM not set — generating an ephemeral RSA key (tokens won't survive restarts)");
+  if (pem) {
+    console.log("[keys] using SIGNING_KEY_PEM");
+  } else if ((pem = meta.get("signing_key_pem"))) {
+    console.log("[keys] using signing key stored in the database");
+  } else {
+    // Generated once and persisted, so tokens stay valid across restarts.
+    console.log("[keys] SIGNING_KEY_PEM not set — generating an RSA key and storing it in the database");
     pem = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    meta.put("signing_key_pem", pem);
   }
   privateKey = await importPKCS8(pem, ALG);
   const spki = createPublicKey(pem).export({ type: "spki", format: "pem" }).toString();
@@ -67,7 +73,7 @@ export async function verifyAccessToken(token: string): Promise<AccessTokenClaim
       typ: "at+jwt",
       algorithms: [ALG],
     });
-    if (revokedJtis.has(payload.jti)) return null;
+    if (isJtiRevoked(payload.jti)) return null;
     return payload;
   } catch {
     return null;
